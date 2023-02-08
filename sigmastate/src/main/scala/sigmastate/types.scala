@@ -2,42 +2,45 @@ package sigmastate
 
 import java.lang.reflect.Method
 import java.math.BigInteger
-
 import org.ergoplatform._
+import org.ergoplatform.settings.ErgoAlgos
 import org.ergoplatform.validation._
 import scalan.{Nullable, RType}
 import scalan.RType.GeneralType
-import sigmastate.SType.{TypeCode, AnyOps}
+import sigmastate.SType.{AnyOps, TypeCode}
 import sigmastate.interpreter._
 import sigmastate.utils.Overloading.Overload1
-import sigmastate.utils.SparseArrayContainer
+import sigmastate.utils.{Helpers, SparseArrayContainer}
 import scalan.util.Extensions._
-import scorex.crypto.authds.{ADKey, ADValue}
-import scorex.crypto.authds.avltree.batch.{Lookup, Insert, Update, Remove}
+import scorex.crypto.authds.{ADDigest, ADKey, ADValue}
+import scorex.crypto.authds.avltree.batch.{Insert, Lookup, Remove, Update}
 import scorex.crypto.hash.Blake2b256
+import scorex.util.ModifierId
 import sigmastate.Values._
 import sigmastate.lang.Terms._
 import sigmastate.lang.{SigmaBuilder, SigmaTyper}
 import sigmastate.SCollection._
 import sigmastate.interpreter.CryptoConstants.{EcPointType, hashLength}
 import sigmastate.serialization.OpCodes
-import special.collection.Coll
+import special.collection.{Coll, CollType}
 import special.sigma._
+
 import scala.language.implicitConversions
 import scala.reflect.{ClassTag, classTag}
-import sigmastate.SMethod.{InvokeDescBuilder, MethodCostFunc, givenCost, javaMethodOf, MethodCallIrBuilder}
+import sigmastate.SMethod.{InvokeDescBuilder, MethodCallIrBuilder, MethodCostFunc, givenCost, javaMethodOf}
 import sigmastate.utxo.ByIndex
 import sigmastate.utxo.ExtractCreationInfo
 import sigmastate.utxo._
-import special.sigma.{Header, Box, SigmaProp, AvlTree, SigmaDslBuilder, PreHeader}
+import special.sigma.{AvlTree, Box, Header, PreHeader, SigmaDslBuilder, SigmaProp}
 import sigmastate.lang.SigmaTyper.STypeSubst
 import sigmastate.eval.Evaluation.stypeToRType
 import sigmastate.eval._
 import sigmastate.lang.exceptions.MethodNotFound
 import spire.syntax.all.cfor
+import supertagged.@@
 
 import scala.collection.mutable
-import scala.util.{Success, Failure}
+import scala.util.{Failure, Success}
 
 /** Base type for all AST nodes of sigma lang. */
 trait SigmaNode extends Product
@@ -232,6 +235,130 @@ object SType {
     case SPreHeader => x.isInstanceOf[PreHeader]
     case SUnit => x.isInstanceOf[Unit]
     case _ => sys.error(s"Unknown type $tpe")
+  }
+
+  /** Synthetic default value for the type.
+    * Used for deserializing contract templates.
+    */
+  def defaultOf[T <: SType](tpe: T): T#WrappedType = {
+    val res = (tpe match {
+      case SBoolean => false
+      case SByte => 0.toByte
+      case SShort => 0.toShort
+      case SInt => 0
+      case SLong => 0.toLong
+      case SBigInt => BigInt(0)
+      case SGroupElement => CGroupElement(CryptoConstants.dlogGroup.identity)
+      case SSigmaProp => CSigmaProp(TrivialProp(false))
+      case SBox => CostingBox(
+        new ErgoBox(
+          0L,
+          new ErgoTree(
+            0.toByte,
+            Vector(),
+            Right(BoolToSigmaProp(EQ(ConstantPlaceholder(0, SInt), IntConstant(1))))
+          ),
+          Colls.emptyColl,
+          Map(),
+          ModifierId @@ ("synthetic_transaction_id"),
+          0.toShort,
+          0
+        )
+      )
+      case c: SCollectionType[_] => SCollectionType(c.elemType)
+      case _: SOption[_] => None
+      case _: STuple => STuple(SInt, SLong)
+      case _: SFunc => SFunc(IndexedSeq(SInt), NoType)
+      case SContext => CostingDataContext(
+        _dataInputs = Colls.emptyColl,
+        headers = Colls.emptyColl,
+        preHeader = CPreHeader(
+          0.toByte,
+          Helpers.decodeBytes("1c597f88969600d2fffffdc47f00d8ffc555a9e85001000001c505ff80ff8f7f"),
+          -755484979487531112L,
+          9223372036854775807L,
+          11,
+          Helpers.decodeGroupElement("0227a58e9b2537103338c237c52c1213bf44bdb344fa07d9df8ab826cca26ca08f"),
+          Helpers.decodeBytes("007f00")
+        ),
+        inputs = Colls.emptyColl,
+        outputs = Colls.emptyColl,
+        height = 11,
+        selfBox = CostingBox(
+          new ErgoBox(
+            0L,
+            new ErgoTree(
+              0.toByte,
+              Vector(),
+              Right(BoolToSigmaProp(EQ(ConstantPlaceholder(0, SInt), IntConstant(1))))
+            ),
+            Colls.emptyColl,
+            Map(),
+            ModifierId @@ ("synthetic_transaction_id"),
+            0.toShort,
+            0
+          )
+        ),
+        selfIndex = 0,
+        lastBlockUtxoRootHash = CAvlTree(
+          AvlTreeData(
+            ADDigest @@ (ErgoAlgos.decodeUnsafe("54d23dd080006bdb56800100356080935a80ffb77e90b800057f00661601807f17")),
+            AvlTreeFlags(insertAllowed = true, updateAllowed = true, removeAllowed = true),
+            1211925457,
+            None
+          )
+        ),
+        _minerPubKey = Helpers.decodeBytes("0227a58e9b2537103338c237c52c1213bf44bdb344fa07d9df8ab826cca26ca08f"),
+        vars = Colls.emptyColl,
+        activatedScriptVersion = 0.toByte,
+        currentErgoTreeVersion = 0.toByte
+      )
+      case SAvlTree => CAvlTree(
+        AvlTreeData(
+          ADDigest @@ (ErgoAlgos.decodeUnsafe("54d23dd080006bdb56800100356080935a80ffb77e90b800057f00661601807f17")),
+          AvlTreeFlags(insertAllowed = true, updateAllowed = true, removeAllowed = false),
+          2147483647,
+          None
+        )
+      )
+      case SGlobal => CostingSigmaDslBuilder
+      case SHeader => CHeader(
+        Colls.fromArray(Blake2b256("Header.id")),
+        0,
+        Colls.fromArray(Blake2b256("Header.parentId")),
+        Colls.fromArray(Blake2b256("ADProofsRoot")),
+        CAvlTree(
+          AvlTreeData(
+            ADDigest @@ (ErgoAlgos.decodeUnsafe("54d23dd080006bdb56800100356080935a80ffb77e90b800057f00661601807f17")),
+            AvlTreeFlags(insertAllowed = true, updateAllowed = true, removeAllowed = false),
+            2147483647,
+            None
+          )
+        ),
+        Colls.fromArray(Blake2b256("transactionsRoot")),
+        timestamp = 0,
+        nBits = 0,
+        height = 0,
+        extensionRoot = Colls.fromArray(Blake2b256("transactionsRoot")),
+        minerPk = SigmaDsl.groupGenerator,
+        powOnetimePk = SigmaDsl.groupGenerator,
+        powNonce = Colls.fromArray(Array[Byte](0, 1, 2, 3, 4, 5, 6, 7)),
+        powDistance = SigmaDsl.BigInt(BigInt("1405498250268750867257727119510201256371618473728619086008183115260323").bigInteger),
+        votes = Colls.fromArray(Array[Byte](0, 1, 2))
+      )
+      case SPreHeader => CPreHeader(
+        0.toByte,
+        Helpers.decodeBytes("7fff7fdd6f62018bae0001006d9ca888ff7f56ff8006573700a167f17f2c9f40"),
+        6306290372572472443L,
+        -3683306095029417063L,
+        1,
+        Helpers.decodeGroupElement("026930cb9972e01534918a6f6d6b8e35bc398f57140d13eb3623ea31fbd069939b"),
+        Helpers.decodeBytes("ff8087")
+      )
+      case SUnit => Unit
+      case _ => sys.error(s"Unknown type $tpe")
+    }).asInstanceOf[T#WrappedType]
+    res
   }
 
   implicit class STypeOps(val tpe: SType) extends AnyVal {

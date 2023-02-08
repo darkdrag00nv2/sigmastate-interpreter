@@ -1,10 +1,15 @@
 package sigmastate
 
+import io.circe.syntax.EncoderOps
+import io.circe.{Decoder, DecodingFailure, Encoder, Json}
+
 import java.math.BigInteger
 import java.util.{Arrays, Objects}
 import org.bitbucket.inkytonik.kiama.rewriting.Rewriter.{count, everywherebu, strategy}
 import org.ergoplatform.settings.ErgoAlgos
 import org.ergoplatform.validation.ValidationException
+import org.ergoplatform.validation.ValidationRules.CheckDeserializedScriptIsSigmaProp
+import org.ergoplatform.JsonCodecs
 import scalan.{Nullable, RType}
 import scalan.util.CollectionUtil._
 import sigmastate.SCollection.{SByteArray, SIntArray}
@@ -21,6 +26,7 @@ import sigmastate.utxo._
 import sigmastate.eval._
 import sigmastate.eval.Extensions._
 import scalan.util.Extensions.ByteOps
+import sigmastate.SType.defaultOf
 import sigmastate.interpreter.ErgoTreeEvaluator._
 import spire.syntax.all.cfor
 
@@ -31,12 +37,14 @@ import sigmastate.serialization.ErgoTreeSerializer.DefaultSerializer
 import sigmastate.serialization.transformers.ProveDHTupleSerializer
 import sigmastate.utils.{SigmaByteReader, SigmaByteWriter}
 import special.sigma.{AvlTree, Header, PreHeader, _}
-import sigmastate.lang.SourceContext
+import sigmastate.lang.{DeserializationSigmaBuilder, SigmaParser, SourceContext, StdSigmaBuilder}
 import sigmastate.lang.exceptions.InterpreterException
 import sigmastate.util.safeNewArray
 import special.collection.Coll
 
-import scala.collection.mutable
+import java.nio.charset.StandardCharsets
+import scala.collection.{IndexedSeq, mutable}
+import scala.util.Try
 
 object Values {
 
@@ -561,7 +569,7 @@ object Values {
       case _ => None
     }
   }
-  
+
   object HeaderConstant {
     def apply(value: Header): Constant[SHeader.type]  = Constant[SHeader.type](value, SHeader)
     def unapply(v: SValue): Option[Header] = v match {
@@ -1227,7 +1235,7 @@ object Values {
     *
     *  The default behavior of ErgoTreeSerializer is to preserve original structure of ErgoTree and check
     *  consistency. In case of any inconsistency the serializer throws exception.
-    *  
+    *
     *  @param header      the first byte of serialized byte array which determines interpretation of the rest of the array
     *
     *  @param constants   If isConstantSegregation == true contains the constants for which there may be
@@ -1522,4 +1530,326 @@ object Values {
       withSegregation(DefaultHeader, prop)
   }
 
+  private def serializeString(s: String, w: SigmaByteWriter): Unit = {
+    val bytes = s.getBytes(StandardCharsets.UTF_8)
+    w.putUInt(bytes.length)
+    w.putBytes(bytes)
+  }
+
+  private def parseString(r: SigmaByteReader): String = {
+    val length = r.getUInt().toInt
+    new String(r.getBytes(length), StandardCharsets.UTF_8)
+  }
+
+  case class Parameter private[sigmastate](
+    name: String,
+    description: String,
+    placeholder: Int
+  ) {
+
+  }
+
+  object Parameter {
+
+    /** Immutable empty IndexedSeq, can be used to save allocations in many places. */
+    val EmptySeq: IndexedSeq[Parameter] = Array.empty[Parameter]
+
+    /** HOTSPOT: don't beautify this code */
+    object serializer extends SigmaSerializer[Parameter, Parameter] {
+      override def serialize(data: Parameter, w: SigmaByteWriter): Unit = {
+        import sigmastate.Operations.ConstantPlaceholderInfo._
+
+        serializeString(data.name, w)
+        serializeString(data.description, w)
+        w.putUInt(data.placeholder, indexArg)
+      }
+
+      override def parse(r: SigmaByteReader): Parameter = {
+        val name = parseString(r)
+        val description = parseString(r)
+        val placeholder = r.getUInt().toInt
+        Parameter(name, description, placeholder)
+      }
+    }
+
+    implicit val encoder: Encoder[Parameter] = Encoder.instance({ p =>
+      Json.obj(
+        "name" -> Json.fromString(p.name),
+        "description" -> Json.fromString(p.description),
+        "placeholder" -> Json.fromInt(p.placeholder)
+      )
+    })
+
+    implicit val decoder: Decoder[Parameter] = Decoder.instance({ cursor =>
+      for {
+        name <- cursor.downField("name").as[String]
+        description <- cursor.downField("description").as[String]
+        placeholder <- cursor.downField("placeholder").as[Int]
+      } yield new Parameter(name, description, placeholder)
+    })
+  }
+
+  case class ContractTemplate private[sigmastate](
+    treeVersion: Option[Byte],
+    name: String,
+    description: String,
+    constTypes: IndexedSeq[SType],
+    constValues: Option[IndexedSeq[Option[SType#WrappedType]]],
+    parameters: IndexedSeq[Parameter],
+    expressionTree: SigmaPropValue
+ ) {
+
+    validate()
+
+    private def validate(): Unit = {
+      require(constValues.isEmpty || constValues.get.size == constTypes.size,
+        s"constValues must be empty or of same length as constTypes. Got ${constValues.get.size}, expected ${constTypes.size}")
+      require(parameters.size <= constTypes.size, "number of parameters must be <= number of constants")
+
+      // Validate that no parameter is duplicated i.e. points to the same position & also to a valid constant.
+      // Also validate that no two parameters exist with the same name.
+      val paramNames = mutable.Set[String]()
+      val paramIndices = this.parameters.map(p => {
+        require(p.placeholder >= 0 && p.placeholder < constTypes.size,
+          s"parameter placeholder must be in range [0, ${constTypes.size})")
+        require(!paramNames.contains(p.name),
+          s"parameter names must be unique. Found duplicate parameters with name ${p.name}")
+        paramNames += p.name
+        p.placeholder
+      }).toSet
+      require(paramIndices.size == parameters.size, "multiple parameters point to the same placeholder")
+
+      // Validate that any constValues[i] = None has a parameter.
+      if (constValues.isEmpty) {
+        require(parameters.size == constTypes.size,
+          "all the constants must be provided via parameter since constValues == None")
+      } else {
+        cfor(0)(_ < constTypes.size, _ + 1) { i =>
+          require(constValues.get(i).isDefined || paramIndices.contains(i),
+            s"placeholder ${i} does not have a default value and absent from parameter as well")
+        }
+      }
+    }
+
+    def applyTemplate(paramValues: Map[String, Constant[SType]]): ErgoTree = {
+      val nConsts = constTypes.size
+      val requiredParameterNames =
+        this.parameters
+          .filter(p => constValues.isEmpty || constValues.get(p.placeholder).isEmpty)
+          .map(p => p.name)
+      requiredParameterNames.foreach(name => require(
+        paramValues.contains(name),
+        s"value for parameter ${name} was not provided while it does not have a default value."))
+
+      val paramIndices = this.parameters.map(p => p.placeholder).toSet
+      val constants = safeNewArray[Constant[SType]](nConsts)
+      cfor(0)(_ < nConsts, _ + 1) { i =>
+        if (paramIndices.contains(i) && paramValues.contains(parameters(i).name)) {
+          val paramValue = paramValues(parameters(i).name)
+          require(paramValue.tpe == constTypes(i),
+            s"parameter type mismatch, expected ${constTypes(i)}, got ${paramValue.tpe}")
+          constants(i) = StdSigmaBuilder.mkConstant(paramValue.value, constTypes(i))
+        } else {
+          constants(i) = StdSigmaBuilder.mkConstant(constValues.get(i).get, constTypes(i))
+        }
+      }
+
+      ErgoTree(
+        ErgoTree.ConstantSegregationHeader,
+        constants,
+        this.expressionTree
+      )
+    }
+
+    /** The default equality of case class is overridden to exclude `complexity`. */
+    override def canEqual(that: Any): Boolean = that.isInstanceOf[ContractTemplate]
+
+    override def hashCode(): Int = Objects.hash(treeVersion, name, description, constTypes, constValues, parameters, expressionTree)
+
+    override def equals(obj: Any): Boolean = (this eq obj.asInstanceOf[AnyRef]) ||
+      ((obj.asInstanceOf[AnyRef] != null) && (obj match {
+        case other: ContractTemplate =>
+          other.treeVersion == treeVersion && other.name == name && other.description == description && other.constTypes == constTypes && other.constValues == constValues && other.parameters == parameters && other.expressionTree == expressionTree
+        case _ => false
+      }))
+  }
+
+  object ContractTemplate {
+    def apply(name: String,
+              description: String,
+              constTypes: IndexedSeq[SType],
+              constValues: Option[IndexedSeq[Option[SType#WrappedType]]],
+              parameters: IndexedSeq[Parameter],
+              expressionTree: SigmaPropValue): ContractTemplate = {
+      new ContractTemplate(None, name, description, constTypes, constValues, parameters, expressionTree)
+    }
+
+    /** HOTSPOT: don't beautify this code */
+    object serializer extends SigmaSerializer[ContractTemplate, ContractTemplate] {
+
+      override def serialize(data: ContractTemplate, w: SigmaByteWriter): Unit = {
+        w.putOption(data.treeVersion)(_.putUByte(_))
+        serializeString(data.name, w)
+        serializeString(data.description, w)
+
+        val nConstants = data.constTypes.length
+        w.putUInt(nConstants)
+        cfor(0)(_ < nConstants, _ + 1) { i =>
+          TypeSerializer.serialize(data.constTypes(i), w)
+        }
+        w.putOption(data.constValues)((_, values) => {
+          cfor(0)(_ < nConstants, _ + 1) { i =>
+            w.putOption(values(i))((_, const) =>
+              DataSerializer.serialize(const, data.constTypes(i), w))
+          }
+        })
+
+        val nParameters = data.parameters.length
+        w.putUInt(nParameters)
+        cfor(0)(_ < nParameters, _ + 1) { i =>
+          Parameter.serializer.serialize(data.parameters(i), w)
+        }
+
+        val expressionTreeWriter = SigmaSerializer.startWriter()
+        ValueSerializer.serialize(data.expressionTree, expressionTreeWriter)
+        val expressionBytes = expressionTreeWriter.toBytes
+        w.putUInt(expressionBytes.length)
+        w.putBytes(expressionBytes)
+      }
+
+      override def parse(r: SigmaByteReader): ContractTemplate = {
+        val treeVersion = r.getOption(r.getUByte().toByte)
+        val name = parseString(r)
+        val description = parseString(r)
+
+        val nConstants = r.getUInt().toInt
+        val constTypes: IndexedSeq[SType] = {
+          if (nConstants > 0) {
+            // HOTSPOT:: allocate new array only if it is not empty
+            val res = safeNewArray[SType](nConstants)
+            cfor(0)(_ < nConstants, _ + 1) { i =>
+              res(i) = TypeSerializer.deserialize(r)
+            }
+            res
+          } else {
+            SType.EmptySeq
+          }
+        }
+        val constValues: Option[IndexedSeq[Option[SType#WrappedType]]] = r.getOption((() => {
+          if (nConstants > 0) {
+            // HOTSPOT:: allocate new array only if it is not empty
+            val res = safeNewArray[Option[SType#WrappedType]](nConstants)
+            cfor(0)(_ < nConstants, _ + 1) { i =>
+              res(i) = r.getOption((() => DataSerializer.deserialize(constTypes(i), r))())
+            }
+            res
+          } else {
+            Array.empty[Option[SType#WrappedType]]
+          }
+        })())
+
+        val nParameters = r.getUInt().toInt
+        val parameters: IndexedSeq[Parameter] = {
+          if (nParameters > 0) {
+            val res = safeNewArray[Parameter](nParameters)
+            cfor(0)(_ < nParameters, _ + 1) { i =>
+              res(i) = Parameter.serializer.parse(r)
+            }
+            res
+          } else {
+            Parameter.EmptySeq
+          }
+        }
+
+        // Populate constants in constantStore so that the expressionTree can be deserialized.
+        val constants = constTypes.indices.map(i => {
+          val t = constTypes(i)
+          DeserializationSigmaBuilder.mkConstant(defaultOf(t), t)
+        })
+        constants.foreach(c => r.constantStore.put(c)(DeserializationSigmaBuilder))
+
+        val _ = r.getUInt().toInt
+        val expressionTree = ValueSerializer.deserialize(r)
+        CheckDeserializedScriptIsSigmaProp(expressionTree)
+
+        ContractTemplate(
+          treeVersion, name, description,
+          constTypes, constValues, parameters,
+          expressionTree.toSigmaProp)
+      }
+    }
+
+    object jsonEncoder extends JsonCodecs {
+
+      implicit val sTypeEncoder: Encoder[SType] = Encoder.instance({ tpe =>
+        Json.fromString(tpe.toTermString)
+      })
+
+      implicit val sTypeDecoder: Decoder[SType] = Decoder.instance({ implicit cursor =>
+        fromTry(Try.apply(SigmaParser.parseType(cursor.value.asString.get)))
+      })
+
+      implicit val encoder: Encoder[ContractTemplate] = Encoder.instance({ ct =>
+        val expressionTreeWriter = SigmaSerializer.startWriter()
+        ValueSerializer.serialize(ct.expressionTree, expressionTreeWriter)
+
+        Json.obj(
+          "treeVersion" -> ct.treeVersion.asJson,
+          "name" -> Json.fromString(ct.name),
+          "description" -> Json.fromString(ct.description),
+          "constTypes" -> ct.constTypes.asJson,
+          "constValues" -> (
+            if (ct.constValues.isEmpty) Json.Null
+            else ct.constValues.get.indices.map(i => ct.constValues.get(i) match {
+              case Some(const) => DataJsonEncoder.encodeData(const, ct.constTypes(i))
+              case None => Json.Null
+            }).asJson),
+          "parameters" -> ct.parameters.asJson,
+          "expressionTree" -> expressionTreeWriter.toBytes.asJson
+        )
+      })
+
+      implicit val decoder: Decoder[ContractTemplate] = Decoder.instance({ implicit cursor =>
+        val constTypesResult = cursor.downField("constTypes").as[IndexedSeq[SType]]
+        val expressionTreeBytesResult = cursor.downField("expressionTree").as[Array[Byte]]
+        (constTypesResult, expressionTreeBytesResult) match {
+          case (Right(constTypes), Right(expressionTreeBytes)) =>
+            val constValuesOpt = {
+              val constValuesJson = cursor.downField("constValues").focus.get
+              if (constValuesJson != Json.Null) {
+                val jsonValues = constValuesJson.asArray.get
+                Some(jsonValues.indices.map(
+                  i => if (jsonValues(i) == Json.Null) None
+                       else Some(DataJsonEncoder.decodeData(jsonValues(i), constTypes(i)))))
+              } else {
+                None
+              }
+            }
+
+            // Populate synthetic constants in the constant store for deserialization of expression tree.
+            val r = SigmaSerializer.startReader(expressionTreeBytes)
+            val constants = constTypes.indices.map(i => {
+              val t = constTypes(i)
+              DeserializationSigmaBuilder.mkConstant(defaultOf(t), t)
+            })
+            constants.foreach(c => r.constantStore.put(c)(DeserializationSigmaBuilder))
+
+            for {
+              treeVersion <- cursor.downField("treeVersion").as[Option[Byte]]
+              name <- cursor.downField("name").as[String]
+              description <- cursor.downField("description").as[String]
+              parameters <- cursor.downField("parameters").as[IndexedSeq[Parameter]]
+            } yield new ContractTemplate(
+              treeVersion,
+              name,
+              description,
+              constTypes,
+              constValuesOpt,
+              parameters,
+              ValueSerializer.deserialize(r).toSigmaProp)
+          case _ => Left(DecodingFailure("Failed to decode contract template", cursor.history))
+        }
+      })
+    }
+  }
 }

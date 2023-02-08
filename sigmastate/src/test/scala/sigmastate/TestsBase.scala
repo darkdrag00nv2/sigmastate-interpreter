@@ -89,4 +89,7 @@ trait TestsBase extends Matchers with VersionTesting {
     val tree = mkTestErgoTree(prop)
     (tree, prop)
   }
+
+  def contractTemplateNameInTests: String = "testContractTemplate"
+  def contractTemplateDescriptionInTests: String = "testContractTemplate description"
 }
